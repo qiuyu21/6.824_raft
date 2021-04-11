@@ -21,6 +21,7 @@ import (
 	//	"bytes"
 	"errors"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,17 +39,19 @@ const (
 
 const (
 	ElectionTimeout time.Duration = 1000 * time.Millisecond
-	HeartbeatTimeout time.Duration = 100 * time.Millisecond
+	HeartbeatTimeout time.Duration = 250 * time.Millisecond
+	ReplicationTimeout time.Duration = 250 * time.Millisecond
 	FailWait time.Duration = 10 * time.Millisecond
 )
 
 const (
-	MaxAppend = 128
+	MaxAppend = 20
 )
 
 var (
 	ErrNotLeader error = errors.New("Not a leader")
 	ErrLeaderStepdown error = errors.New("Leader has stepped down")
+	ErrLogNotFound error = errors.New("Log not found")
 )
 
 //
@@ -132,14 +135,6 @@ type pending struct {
 	responded 		bool
 }
 
-type LogStore interface {
-
-}
-
-type Log struct {
-
-}
-
 type voteResult struct {
 	server	int 
 	ok 		bool
@@ -177,6 +172,11 @@ type AppendEntriesReply struct {
 	LastIndex		uint64
 }
 
+type matchIndexSlice []uint64
+func (s matchIndexSlice) Len() int           { return len(s) }
+func (s matchIndexSlice) Less(i, j int) bool { return s[i] < s[j] }
+func (s matchIndexSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+
 func (p *pending) respond(err error){
 	if p.responseCh == nil {
 		return
@@ -198,6 +198,15 @@ func (rf *Raft) getState() (s uint8){
 	s = rf.state
 	rf.mu.Unlock()
 
+	return
+}
+
+
+func (rf *Raft) getLastEntry() (index uint64, term uint64){
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	index = rf.lastLogIndex
+	term = rf.lastLogTerm
 	return
 }
 
@@ -266,9 +275,7 @@ func (rf *Raft) readPersist(data []byte) {
 // have more recent info since it communicate the snapshot on applyCh.
 //
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
 	// Your code here (2D).
-
 	return true
 }
 
@@ -278,7 +285,6 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
 }
 
 //
@@ -393,7 +399,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -408,12 +413,42 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 //
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
+	index = -1
+	term = -1
+	isLeader = true
 	// Your code here (2B).
-	return index, term, isLeader
+
+	rf.mu.Lock()
+	isLeader = rf.leader == rf.me
+	rf.mu.Unlock()
+
+	if isLeader == false {
+		return
+	}
+
+	newLog := &pending{
+		log: &Log{
+			Data: command,
+		},
+		responseCh: make(chan error, 1),
+		responded: false,
+	}
+
+	rf.newLogCh <- newLog 
+
+	select {
+	case err := <- newLog.responseCh:
+		if err != nil {
+			rf.logger.Infof("new command has failed: %v", err)
+			return
+		}
+		index = int(newLog.log.Index)
+		term = int(newLog.log.Term)
+		rf.logger.Infof("new command with index %v and term %v has been replicated", index, term)
+	}
+
+	return
 }
 
 //
@@ -587,12 +622,53 @@ func (rf *Raft) runLeader() {
 
 	for rf.killed() == false && rf.getState() == Leader {
 		select {
-		case <- rf.newLogCh:
+		case newLog := <- rf.newLogCh:		
+			logs := make([]*Log, 0, MaxAppend)
+			logs = append(logs, newLog.log)
+			for i:= 1; i<MaxAppend; i++ {
+				select {
+					case l := <-rf.newLogCh:
+						logs = append(logs, l.log)
+					default:			
+				}
+			}
+			// assign index & term to logs
+			rf.setupLogs(logs)
+			// store the log
+			rf.logs.StoreLogs(logs)
+			// update leader match index
+			rf.commitment.mu.Lock()
+			rf.commitment.matchIndexes[rf.me] = logs[len(logs)-1].Index
+			rf.commitment.mu.Unlock()
+			
+			// notify replication threads
+			for _, peer := range rf.leaderState.replState {
+				go func(r *replicationState){
+					select {
+					case r.notifyCh <- struct{}{}:
+					default:
+					}
+				}(peer)
+			}
 		default:
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// setupLogs assign index & term to logs
+func (rf *Raft) setupLogs(logs []*Log){
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for _, log := range logs {
+		rf.lastLogIndex++
+		log.Index = rf.lastLogIndex
+		log.Term = rf.currentTerm
+	}
+
+	rf.lastLogTerm = rf.currentTerm
+} 
 
 func (rf *Raft) cleanupLeaderState() {
 	rf.leaderState.mu.Lock()
@@ -602,18 +678,18 @@ func (rf *Raft) cleanupLeaderState() {
 	rf.leaderState.mu.Unlock()
 }
 
-// lock needs to be held by leader main thread
+// lock is held in leader main thread
 func (rf *Raft) initializeLeaderState() {
 	rf.leaderState.replState = make(map[int]*replicationState, len(rf.peers)-1)
 	rf.leaderState.inflight = make([]*pending, 0, 128)
 	rf.leaderState.commitment = &commitment{
-		matchIndexes: make(map[int]uint64, len(rf.peers)-1),
+		matchIndexes: make(map[int]uint64, len(rf.peers)),
 		commitIndex: rf.commitIndex,
 		startIndex: rf.lastLogIndex+1,
 	}
 }
 
-// lock needs to be held by leader main thread
+// lock is held in leader main thread
 func (rf *Raft) runAppendEntries() {
 	for peer := range rf.peers {
 		if peer == rf.me {
@@ -628,7 +704,131 @@ func (rf *Raft) runAppendEntries() {
 		}
 		rf.leaderState.replState[peer] = r
 		go rf.heartbeat(peer, rf.currentTerm)
+		go rf.replicate(r)
 	}
+}
+
+func (rf *Raft) replicate(r *replicationState){
+	var args AppendEntriesArgs
+	var reply AppendEntriesReply
+	var err error
+
+	timeout := time.Tick(ReplicationTimeout)
+
+	for {
+		select {
+		case <- r.notifyCh:
+		case <- timeout:
+		}
+		lastLogIndex, _ := rf.getLastEntry()
+		if err = rf.makeAppendEntriesRequest(r, &args, lastLogIndex); err != nil {
+			rf.logger.Errorf("replication thread for leader %v failed at makeAppendEntriesRequest: %v", rf.me, err)
+			return
+		}
+		if ok := rf.sendAppendEntries(r.serverId, &args, &reply); ok == false {
+			rf.logger.Infof("replication thread for leader %v has lost connection with server %v", rf.me, r.serverId)
+			time.Sleep(FailWait)
+			continue
+		}
+		if reply.Success == false {
+			if reply.Term > r.currentTerm {
+				// found newer term, step down
+				rf.logger.Infof("replciation thead for leader %v has found newer term %v from server %v, stepping down", rf.me, reply.Term, r.serverId)
+				rf.mu.Lock()
+				rf.currentTerm = reply.Term 
+				rf.leader = -1
+				rf.state = Follower
+				rf.mu.Unlock()
+				return
+			}
+			// incorrect prevLogIndex || prevLogTerm
+			r.setNextIndex(reply.LastIndex)	
+		}else{
+		rf.logger.Infof("replication thread for leader %v replicated %v logs to server %v", rf.me, len(args.Entries), r.serverId)
+		// update leader commit index
+		r.commitment.updateCommitIndex(r.serverId, lastLogIndex)
+		// update next index 
+		r.setNextIndex(lastLogIndex + 1) 
+		}
+	}
+}
+
+func (c *commitment) updateCommitIndex(serverId int, matchIndex uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.matchIndexes[serverId] = matchIndex
+	c.calculateCommitIndex()
+}
+
+func (c *commitment) calculateCommitIndex() {
+	matches := make([]uint64, 0, len(c.matchIndexes))
+	for _, matchIndex := range c.matchIndexes {
+		matches = append(matches, matchIndex)
+	}
+	sort.Sort(matchIndexSlice(matches))
+	newCommitIndex := matches[(len(matches)-1)/2]
+	if newCommitIndex > c.commitIndex && newCommitIndex > c.startIndex {
+		c.commitIndex = newCommitIndex
+	}
+}
+
+// makeAppendEntriesRequest constructs AppendEntriesArgs to send to peer 
+func (rf *Raft) makeAppendEntriesRequest(r *replicationState, args *AppendEntriesArgs, lastLogIndex uint64) (err error) {
+	err = nil
+	nextIndex := r.getNextIndex()
+	args.LeaderId = rf.me
+	args.Term = r.currentTerm
+	if err = rf.makePrev(args, nextIndex); err != nil {
+		return err
+	}
+	if err = rf.makeLogs(args, nextIndex, lastLogIndex); err != nil{
+		return err
+	}
+	return
+}
+
+// makePrev is called by makeAppendEntriesRequest to continue setting up AppendEntriesArgs
+func (rf *Raft) makePrev(args *AppendEntriesArgs, nextIndex uint64) error{
+	if nextIndex == 1 {
+		args.PrevLogIndex = 0
+		args.PrevLogTerm = 0
+	}else{
+		var l Log 
+		if err := rf.logs.GetLog(nextIndex-1, &l); err != nil {
+			return err
+		}
+		args.PrevLogIndex = l.Index
+		args.PrevLogTerm = l.Term
+	}
+	return nil
+}
+
+// makeLogs is called by makeAppendEntriesRequest to continue setting up AppendEntriesArgs
+func (rf *Raft) makeLogs(args *AppendEntriesArgs, nextIndex, endIndex uint64) error {
+	logs := make([]*Log, 0, 128)
+	for i := nextIndex; i<=endIndex; i++ {
+		l := new(Log)
+		if err := rf.logs.GetLog(i, l); err != nil{
+			return err
+		}
+		logs = append(logs, l)
+	}
+	args.Entries = logs
+	return nil
+}
+
+func (r *replicationState) getNextIndex() (index uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	index = r.nextIndex
+	return
+}
+
+func (r *replicationState) setNextIndex(index uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.nextIndex = index
+	return
 }
 
 func (rf *Raft) heartbeat(serverId int, term uint64) {
@@ -654,7 +854,6 @@ func (rf *Raft) heartbeat(serverId int, term uint64) {
 			return
 		}
 	}
-	
 }
 
 func (rf *Raft) runRaft() {
@@ -700,6 +899,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastLogTerm = 0
 	rf.state = Follower
 	rf.newLogCh = make(chan *pending, MaxAppend)
+	rf.logs = newInmemLogStore()
 
 	// rf.logger.SetLevel(logrus.ErrorLevel)
 
