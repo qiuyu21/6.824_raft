@@ -40,13 +40,13 @@ const (
 
 const (
 	ElectionTimeout time.Duration = 1500 * time.Millisecond
-	HeartbeatTimeout time.Duration = 100 * time.Millisecond
-	ReplicationTimeout time.Duration = 1000 * time.Millisecond
+	HeartbeatTimeout time.Duration = 200 * time.Millisecond
+	ReplicationTimeout time.Duration = 200 * time.Millisecond
 	FailWait time.Duration = 10 * time.Millisecond
 )
 
 const (
-	MaxAppend = 20
+	// MaxAppend = 20
 )
 
 var (
@@ -104,7 +104,6 @@ type Raft struct {
 	lastLogIndex	uint64
 	lastLogTerm 	uint64
 	state 			uint8
-	newLogCh 		chan *pending
 	notifyCh 		chan struct{} 	// notify main loop commit index has been updated
 	leaderState
 }
@@ -187,11 +186,9 @@ func (p *pending) respond(err error){
 	if p.responseCh == nil {
 		return
 	}
-
 	if p.responded {
 		return
 	}
-
 	p.responseCh <- err
 	close(p.responseCh)
 	p.responded = true
@@ -233,7 +230,6 @@ func randomTimeout(base time.Duration) time.Duration {
 	offset := time.Duration(rand.Int63()) % (base*2)
 	return base + offset
 }
-
 
 func (rf *Raft) sendApplyMsg() {
 	rf.mu.Lock()
@@ -318,6 +314,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// fmt.Printf(`%v receives request vote from %v, 
+	// 			my term %v, his term %v, 
+	// 			my last voted term: %v
+	// 			my last log index: %v, his last log index: %v 
+	// 			my last log term: %v, his last log term %v \n`, 
+	// 			rf.me, args.CandidateId, rf.currentTerm, args.Term, rf.lastVotedTerm)
+
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
@@ -340,8 +343,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if rf.lastLogIndex > args.LastLogIndex || rf.lastLogTerm > args.LastLogTerm {
-		// ignore old candidate
+	if rf.lastLogTerm > args.LastLogTerm {
+		return
+	}
+
+	if rf.lastLogTerm == args.LastLogTerm && rf.lastLogIndex > args.LastLogIndex {
 		return
 	}
 
@@ -360,8 +366,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = false 
 	reply.Term = rf.currentTerm
 	reply.LastIndex = rf.lastLogIndex
-
+	
 	if reply.Term > args.Term {
+		// fmt.Printf("(1) leader %v with term %v is sending %v logs to %v with term %v\n", args.LeaderId, args.Term, len(args.Entries), rf.me, rf.currentTerm)
+		// fmt.Printf("Replying: success: %v, term: %v\n", reply.Success, reply.Term)
 		return 
 	}
 
@@ -392,7 +400,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if len(args.Entries) > 0 {
-		rf.logger.Infof("%v receives new logs from leader %v", rf.me, args.LeaderId)
 		// non-heartbeat
 		var newlogs []*Log
 		for i, entry := range args.Entries {
@@ -406,7 +413,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.logger.Errorf("2:GetLog error(2): %v", err)
 				return
 			}
-			if l.Index != entry.Index {
+			if l.Term != entry.Term {
 				if err := rf.logs.DeleteRange(l.Index, rf.lastLogIndex); err != nil {
 					rf.logger.Errorf("DeleteRange error: %v", err) 
 					return 
@@ -430,15 +437,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// update commit index
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(rf.lastLogIndex, args.LeaderCommit)
-
-		// ===============
-		// ===============
-		// notify tester
 		go func(){
 			rf.sendApplyMsg()
 		}()
-		// ===============
-		// ===============
 	}
 
 	reply.Success = true
@@ -504,36 +505,42 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	term = -1
 	isLeader = true
 	// Your code here (2B).
-
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	isLeader = rf.leader == rf.me
-	rf.mu.Unlock()
-
 	if isLeader == false {
 		return
 	}
-
+	rf.lastLogIndex++
+	rf.lastLogTerm = rf.currentTerm
 	newLog := &pending{
 		log: &Log{
 			Data: command,
+			Index: rf.lastLogIndex,
+			Term: rf.currentTerm,
 		},
 		responseCh: make(chan error, 1),
 		responded: false,
 	}
-
-	rf.newLogCh <- newLog 
-
-	select {
-	case err := <- newLog.responseCh:
-		if err != nil {
-			rf.logger.Infof("new command has failed: %v", err)
-			return
-		}
-		index = int(newLog.log.Index)
-		term = int(newLog.log.Term)
-		rf.logger.Infof("new command with index %v and term %v has been replicated", index, term)
+	// persistently store the log 
+	rf.logs.StoreLog(newLog.log)
+	// append to inflight
+	// rf.inflight = append(rf.inflight, newLog)
+	// update leader match index
+	rf.commitment.mu.Lock()
+	rf.commitment.matchIndexes[rf.me] = newLog.log.Index
+	rf.commitment.mu.Unlock()
+	// notify replication threads
+	for _, peer := range rf.leaderState.replState {
+		go func(r *replicationState){
+			select {
+			case r.notifyCh <- struct{}{}:
+			default:
+			}
+		}(peer)
 	}
-
+	index = int(newLog.log.Index)
+	term = int(newLog.log.Term)
 	return
 }
 
@@ -571,12 +578,11 @@ func (rf *Raft) ticker() {
 func (rf *Raft) runFollower() {
 	rf.logger.Infof("server %v entering Follower state", rf.me)
 	for rf.getState() == Follower && rf.killed() == false {
-		select {
-		case r := <-rf.newLogCh:
-			r.respond(ErrNotLeader)
-		default:
-		}
-
+		// select {
+		// case r := <-rf.newLogCh:
+		// 	r.respond(ErrNotLeader)
+		// default:
+		// }
 		timeout := randomTimeout(ElectionTimeout)
 		time.Sleep(timeout)
 	
@@ -647,8 +653,8 @@ func (rf *Raft) runCandidate() {
 			
 				return
 			}
-		case r := <-rf.newLogCh:
-			r.respond(ErrNotLeader)
+		// case r := <-rf.newLogCh:
+		// 	r.respond(ErrNotLeader)
 		}
 	}
 }
@@ -707,97 +713,44 @@ func (rf *Raft) runLeader() {
 
 	for rf.killed() == false && rf.getState() == Leader {
 		select {
-		case newLog := <- rf.newLogCh:
-			logs := make([]*Log, 0, MaxAppend)
-			logs = append(logs, newLog.log)
-			rf.inflight = append(rf.inflight, newLog)
-			for i:= 1; i<MaxAppend; i++ {
-				select {
-					case l := <-rf.newLogCh:
-						logs = append(logs, l.log)
-						rf.inflight = append(rf.inflight, l)
-					default:			
-				}
-			}
-			// assign index & term to logs
-			rf.setupLogs(logs)
-			// store the log
-			rf.logs.StoreLogs(logs)
-			// update leader match index
-			rf.commitment.mu.Lock()
-			rf.commitment.matchIndexes[rf.me] = logs[len(logs)-1].Index
-			rf.commitment.mu.Unlock()
-			
-			// notify replication threads
-			for _, peer := range rf.leaderState.replState {
-				go func(r *replicationState){
-					select {
-					case r.notifyCh <- struct{}{}:
-					default:
-					}
-				}(peer)
-			}
 		case <- rf.leaderState.commitCh:
 			rf.leaderState.commitment.mu.Lock()
 			commitIndex := rf.leaderState.commitment.commitIndex
 			rf.leaderState.commitment.mu.Unlock()
 			//respond to all finished requests
-			for i, inflightEntry := range rf.leaderState.inflight {
-				if inflightEntry.log.Index <= commitIndex {
-					go func (p *pending)  {
-						p.responseCh <- nil
-					}(inflightEntry)
-					rf.inflight = append(rf.leaderState.inflight[:i], rf.leaderState.inflight[i+1:]...)
-				}
-			}
+			// for i, inflightEntry := range rf.leaderState.inflight {
+			// 	if inflightEntry.log.Index <= commitIndex {
+			// 		go func (p *pending)  {
+			// 			p.responseCh <- nil
+			// 		}(inflightEntry)
+			// 		rf.inflight = append(rf.leaderState.inflight[:i], rf.leaderState.inflight[i+1:]...)
+			// 	}
+			// }
 			// update commit index in leader's Raft struct
 			rf.mu.Lock()
 			rf.commitIndex = commitIndex
 			rf.mu.Unlock()
-
-			// ===============
-			// ===============
 			// notify tester
 			go func(){
-				fmt.Println("leader sending")
 				rf.sendApplyMsg()
 			}()
-			// ===============
-			// ===============
 		default:
 		}
-		time.Sleep(10 * time.Millisecond)
-
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-// setupLogs assign index & term to logs
-func (rf *Raft) setupLogs(logs []*Log){
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	for _, log := range logs {
-		rf.lastLogIndex++
-		log.Index = rf.lastLogIndex
-		log.Term = rf.currentTerm
-	}
-
-	rf.lastLogTerm = rf.currentTerm
-} 
-
 func (rf *Raft) cleanupLeaderState() {
-	// rf.leaderState.mu.Lock()
 	rf.leaderState.replState = nil
 	rf.inflight = nil
 	rf.commitment = nil
 	rf.commitCh = nil
-	// rf.leaderState.mu.Unlock()
 }
 
 // lock is held in leader main thread
 func (rf *Raft) initializeLeaderState() {
 	rf.leaderState.replState = make(map[int]*replicationState, len(rf.peers)-1)
-	rf.leaderState.inflight = make([]*pending, 0, 128)
+	rf.leaderState.inflight = make([]*pending, 0, 256)
 	rf.leaderState.commitCh = make(chan struct{}, 128)
 	rf.leaderState.commitment = &commitment{
 		matchIndexes: make(map[int]uint64, len(rf.peers)),
@@ -827,31 +780,32 @@ func (rf *Raft) runAppendEntries() {
 }
 
 func (rf *Raft) replicate(r *replicationState){
-	var args AppendEntriesArgs
-	var reply AppendEntriesReply
-	var err error
-
 	timeout := time.Tick(ReplicationTimeout)
 
 	for {
+		var args AppendEntriesArgs
+		var reply AppendEntriesReply
+		var err error
+
 		select {
 		case <- r.notifyCh:
 		case <- timeout:
 		}
+
 		lastLogIndex, _ := rf.getLastEntry()
 		if err = rf.makeAppendEntriesRequest(r, &args, lastLogIndex); err != nil {
 			rf.logger.Errorf("replication thread for leader %v failed at makeAppendEntriesRequest: %v", rf.me, err)
 			return
 		}
 		if ok := rf.sendAppendEntries(r.serverId, &args, &reply); ok == false {
-			rf.logger.Infof("replication thread for leader %v has lost connection with server %v", rf.me, r.serverId)
+			// rf.logger.Infof("replication thread for leader %v has lost connection with server %v", rf.me, r.serverId)
 			time.Sleep(FailWait)
 			continue
 		}
 		if reply.Success == false {
 			if reply.Term > r.currentTerm {
 				// found newer term, step down
-				rf.logger.Infof("replciation thead for leader %v has found newer term %v from server %v, stepping down", rf.me, reply.Term, r.serverId)
+				// rf.logger.Infof("replciation thead for leader %v has found newer term %v from server %v, stepping down", rf.me, reply.Term, r.serverId)
 				rf.mu.Lock()
 				rf.currentTerm = reply.Term 
 				rf.leader = -1
@@ -860,9 +814,9 @@ func (rf *Raft) replicate(r *replicationState){
 				return
 			}
 			// incorrect prevLogIndex || prevLogTerm
-			r.setNextIndex(max(reply.LastIndex-1,1))	
+			r.setNextIndex(max(r.getNextIndex()-1,1))	
 		}else{
-		rf.logger.Infof("replication thread for leader %v replicated %v logs to server %v", rf.me, len(args.Entries), r.serverId)
+		// rf.logger.Infof("replication thread for leader %v replicated %v logs to server %v", rf.me, len(args.Entries), r.serverId)
 		// update leader commit index
 		r.commitment.updateCommitIndex(r.serverId, lastLogIndex)
 		// update next index 
@@ -898,12 +852,17 @@ func (rf *Raft) makeAppendEntriesRequest(r *replicationState, args *AppendEntrie
 	nextIndex := r.getNextIndex()
 	args.LeaderId = rf.me
 	args.Term = r.currentTerm
+	rf.mu.Lock()
+	args.LeaderCommit = rf.commitIndex
+	rf.mu.Unlock()
 	if err = rf.makePrev(args, nextIndex); err != nil {
 		return err
 	}
 	if err = rf.makeLogs(args, nextIndex, lastLogIndex); err != nil{
 		return err
 	}
+	// fmt.Printf("leader %v sending %v logs to server %v, from index %v to index %v\n", 
+	// 			rf.me, lastLogIndex-nextIndex+1, r.serverId, nextIndex, lastLogIndex)
 	return
 }
 
@@ -952,23 +911,20 @@ func (r *replicationState) setNextIndex(index uint64) {
 }
 
 func (rf *Raft) heartbeat(serverId int, term uint64) {
-	var args AppendEntriesArgs
-	var reply AppendEntriesReply
-	args.Term = term
-	args.LeaderId = rf.me
 
 	// don't immediately send heartbeat to avoid multiple leaders
-	time.Sleep(10 * time.Millisecond)
+	// time.Sleep(10 * time.Millisecond)
 
 	for {
+		var args AppendEntriesArgs
+		var reply AppendEntriesReply
+		args.Term = term
+		args.LeaderId = rf.me
+
 		time.Sleep(HeartbeatTimeout)
 
-		rf.mu.Lock()
-		args.LeaderCommit = rf.commitIndex
-		rf.mu.Unlock()
-
 		if err:= rf.sendAppendEntries(serverId, &args, &reply); err == false {
-			rf.logger.Infof("leader %v has lost connection to %v", rf.me, serverId)
+			// rf.logger.Infof("leader %v has lost connection to %v", rf.me, serverId)
 			time.Sleep(FailWait)
 			continue
 		}
@@ -1029,7 +985,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastLogIndex = 0
 	rf.lastLogTerm = 0
 	rf.state = Follower
-	rf.newLogCh = make(chan *pending, MaxAppend)
+	// rf.newLogCh = make(chan *pending, MaxAppend)
 	rf.logs = newInmemLogStore()
 
 	// rf.logger.SetLevel(logrus.ErrorLevel)

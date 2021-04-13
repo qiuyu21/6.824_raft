@@ -523,7 +523,6 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				}
 			}
 		}
-
 		if index != -1 {
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
@@ -546,6 +545,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
+	cfg.showLogs()
 	cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 	return -1
 }
@@ -592,4 +592,14 @@ func (cfg *config) LogSize() int {
 		}
 	}
 	return logsize
+}
+
+
+
+
+
+func (cfg *config) showLogs() {
+	for j := 0; j < len(cfg.logs); j++ {
+		log.Printf("%v: server %v\n", j, cfg.logs[j])
+	}
 }
