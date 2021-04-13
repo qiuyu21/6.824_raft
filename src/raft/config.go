@@ -545,7 +545,6 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	cfg.showLogs()
 	cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 	return -1
 }
@@ -594,12 +593,10 @@ func (cfg *config) LogSize() int {
 	return logsize
 }
 
-
-
-
-
 func (cfg *config) showLogs() {
+	cfg.mu.Lock()
+	defer cfg.mu.Unlock()
 	for j := 0; j < len(cfg.logs); j++ {
-		log.Printf("%v: server %v\n", j, cfg.logs[j])
+		log.Printf("%v: server %v\n\n\n", j, cfg.logs[j])
 	}
 }

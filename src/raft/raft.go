@@ -40,8 +40,8 @@ const (
 
 const (
 	ElectionTimeout time.Duration = 1500 * time.Millisecond
-	HeartbeatTimeout time.Duration = 200 * time.Millisecond
-	ReplicationTimeout time.Duration = 200 * time.Millisecond
+	HeartbeatTimeout time.Duration = 100 * time.Millisecond
+	ReplicationTimeout time.Duration = 500 * time.Millisecond
 	FailWait time.Duration = 10 * time.Millisecond
 )
 
@@ -390,11 +390,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			var l Log
 			if err := rf.logs.GetLog(args.PrevLogIndex, &l); err != nil{
 				rf.logger.Errorf("1:GetLog error: %v", err)
+				// return my last log index
 				return
 			}
 			term = l.Term
 		}
 		if term != args.PrevLogTerm {
+			// find the first index of the term
+			startIndex := rf.lastLogIndex - 1 
+			for startIndex > 0 {
+				var l Log 
+				if err := rf.logs.GetLog(startIndex, &l); err != nil {
+					rf.logger.Errorf("2:GetLog error: %v", err)
+					return
+				}
+				if l.Term != term {
+					break
+				}
+				startIndex--
+			}
+			reply.LastIndex = startIndex
+			// fmt.Printf("=========last index: %v\n", startIndex)
 			return
 		}
 	}
@@ -410,7 +426,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// get the log
 			var l Log 
 			if err := rf.logs.GetLog(entry.Index, &l); err != nil {
-				rf.logger.Errorf("2:GetLog error(2): %v", err)
+				rf.logger.Errorf("3:GetLog error: %v", err)
 				return
 			}
 			if l.Term != entry.Term {
@@ -750,13 +766,18 @@ func (rf *Raft) cleanupLeaderState() {
 // lock is held in leader main thread
 func (rf *Raft) initializeLeaderState() {
 	rf.leaderState.replState = make(map[int]*replicationState, len(rf.peers)-1)
-	rf.leaderState.inflight = make([]*pending, 0, 256)
+	// rf.leaderState.inflight = make([]*pending, 0, 256)
 	rf.leaderState.commitCh = make(chan struct{}, 128)
 	rf.leaderState.commitment = &commitment{
 		matchIndexes: make(map[int]uint64, len(rf.peers)),
 		commitIndex: rf.commitIndex,
 		startIndex: rf.lastLogIndex,
 		commitCh: rf.leaderState.commitCh,
+	}
+
+	//initialize matchIndexes
+	for i := 0; i<len(rf.peers); i++ {
+		rf.leaderState.commitment.matchIndexes[i] = 0
 	}
 }
 
@@ -814,7 +835,7 @@ func (rf *Raft) replicate(r *replicationState){
 				return
 			}
 			// incorrect prevLogIndex || prevLogTerm
-			r.setNextIndex(max(r.getNextIndex()-1,1))	
+			r.setNextIndex(1)	
 		}else{
 		// rf.logger.Infof("replication thread for leader %v replicated %v logs to server %v", rf.me, len(args.Entries), r.serverId)
 		// update leader commit index

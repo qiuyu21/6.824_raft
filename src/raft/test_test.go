@@ -141,10 +141,10 @@ const RaftElectionTimeout = 1000 * time.Millisecond
 // 	cfg.end()
 // }
 
-// //
-// // check, based on counting bytes of RPCs, that
-// // each command is sent to each peer just once.
-// //
+//
+// check, based on counting bytes of RPCs, that
+// each command is sent to each peer just once.
+//
 // func TestRPCBytes2B(t *testing.T) {
 // 	servers := 3
 // 	cfg := make_config(t, servers, false, false)
@@ -376,7 +376,7 @@ const RaftElectionTimeout = 1000 * time.Millisecond
 // 	cfg.rafts[leader1].Start(104)
 
 // 	// new leader commits, also for index=2
-// 	cfg.one(103, 4, true)
+// 	cfg.one(103, 2, true)
 
 // 	// new leader network failure
 // 	leader2 := cfg.checkOneLeader()
@@ -384,7 +384,7 @@ const RaftElectionTimeout = 1000 * time.Millisecond
 
 // 	// old leader connected again
 // 	cfg.connect(leader1)
-// 	cfg.one(104, 4, true)
+// 	cfg.one(104, 2, true)
 
 // 	// all together now
 // 	cfg.connect(leader2)
@@ -405,33 +405,37 @@ func TestBackup2B(t *testing.T) {
 	// put leader and one follower in a partition
 	leader1 := cfg.checkOneLeader()
 	fmt.Printf("leader: %v\n", leader1)
-	cfg.disconnect((leader1 + 2) % servers)
-	cfg.disconnect((leader1 + 3) % servers)
-	cfg.disconnect((leader1 + 4) % servers)
+	cfg.disconnect((leader1 + 2) % servers)		//0
+	cfg.disconnect((leader1 + 3) % servers)		//1
+	cfg.disconnect((leader1 + 4) % servers)		//2
 	fmt.Printf("disconnected servers: %v, %v, %v\n", (leader1 + 2) % servers, (leader1 + 3) % servers,(leader1 + 4) % servers)
 
 
 	// submit lots of commands that won't commit
-	for i := 0; i < 50; i++ {
+	for i := 0; i < 50; i++ {					
 		cfg.rafts[leader1].Start(rand.Int())
 	}
 
+	//====== 3, 4 will have 51 logs in their log storage, not committed
+
 	time.Sleep(RaftElectionTimeout / 2)
 
-	cfg.disconnect((leader1 + 0) % servers)
-	cfg.disconnect((leader1 + 1) % servers)
+	cfg.disconnect((leader1 + 0) % servers)		// 3
+	cfg.disconnect((leader1 + 1) % servers)		// 4
 	fmt.Printf("disconnected leader %v and server: %v \n", (leader1 + 0) % servers, (leader1 + 1) % servers)
 
 	// allow other partition to recover
-	cfg.connect((leader1 + 2) % servers)
-	cfg.connect((leader1 + 3) % servers)
-	cfg.connect((leader1 + 4) % servers)
+	cfg.connect((leader1 + 2) % servers)		// 0
+	cfg.connect((leader1 + 3) % servers)		// 1
+	cfg.connect((leader1 + 4) % servers)		// 2
 	fmt.Printf("reconnected servers: %v, %v, %v\n", (leader1 + 2) % servers, (leader1 + 3) % servers,(leader1 + 4) % servers)
 
 	// lots of successful commands to new group.
+	//====== 0, 1, 2 will add another 50 logs, totalling 51, all committed
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
+
 
 	// now another partitioned leader and one follower
 	leader2 := cfg.checkOneLeader()
@@ -440,11 +444,16 @@ func TestBackup2B(t *testing.T) {
 		other = (leader2 + 1) % servers
 	}
 	cfg.disconnect(other)
+	fmt.Printf("=====disconnected other: %v\n", other)
+
+	time.Sleep(3 * time.Second)
 
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader2].Start(rand.Int())
 	}
+
+	//====== two of 0, 1, 2 will add another 50 logs, totalling 101 logs, uncommitted
 
 	time.Sleep(RaftElectionTimeout / 2)
 
@@ -455,7 +464,8 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
-	//other will become the new leader of the group
+	//===== other will become the new leader of the group as other have 51 logs
+	//===== two others also have 51 logs, but only 1 of those has been committed.
 	fmt.Printf("reconnected servers: %v, %v, %v\n", (leader1 + 0) % servers, (leader1 + 1) % servers, other)
 
 	// lots of successful commands to new group.
