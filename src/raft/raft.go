@@ -812,36 +812,40 @@ func (rf *Raft) replicate(r *replicationState){
 		case <- r.notifyCh:
 		case <- timeout:
 		}
-
-		lastLogIndex, _ := rf.getLastEntry()
-		if err = rf.makeAppendEntriesRequest(r, &args, lastLogIndex); err != nil {
-			rf.logger.Errorf("replication thread for leader %v failed at makeAppendEntriesRequest: %v", rf.me, err)
-			return
-		}
-		if ok := rf.sendAppendEntries(r.serverId, &args, &reply); ok == false {
-			// rf.logger.Infof("replication thread for leader %v has lost connection with server %v", rf.me, r.serverId)
-			time.Sleep(FailWait)
-			continue
-		}
-		if reply.Success == false {
-			if reply.Term > r.currentTerm {
-				// found newer term, step down
-				// rf.logger.Infof("replciation thead for leader %v has found newer term %v from server %v, stepping down", rf.me, reply.Term, r.serverId)
-				rf.mu.Lock()
-				rf.currentTerm = reply.Term 
-				rf.leader = -1
-				rf.state = Follower
-				rf.mu.Unlock()
+	
+		for{
+			lastLogIndex, _ := rf.getLastEntry()
+			if err = rf.makeAppendEntriesRequest(r, &args, lastLogIndex); err != nil {
+				rf.logger.Errorf("replication thread for leader %v failed at makeAppendEntriesRequest: %v", rf.me, err)
 				return
 			}
-			// incorrect prevLogIndex || prevLogTerm
-			r.setNextIndex(1)	
-		}else{
-		// rf.logger.Infof("replication thread for leader %v replicated %v logs to server %v", rf.me, len(args.Entries), r.serverId)
-		// update leader commit index
-		r.commitment.updateCommitIndex(r.serverId, lastLogIndex)
-		// update next index 
-		r.setNextIndex(lastLogIndex + 1)
+			if ok := rf.sendAppendEntries(r.serverId, &args, &reply); ok == false {
+				// rf.logger.Infof("replication thread for leader %v has lost connection with server %v", rf.me, r.serverId)
+				time.Sleep(FailWait)
+				continue
+			}
+			if reply.Success == false {
+				if reply.Term > r.currentTerm {
+					// found newer term, step down
+					// rf.logger.Infof("replciation thead for leader %v has found newer term %v from server %v, stepping down", rf.me, reply.Term, r.serverId)
+					rf.mu.Lock()
+					rf.currentTerm = reply.Term 
+					rf.leader = -1
+					rf.state = Follower
+					rf.mu.Unlock()
+					return
+				}
+				// incorrect prevLogIndex || prevLogTerm
+				r.setNextIndex(max(r.nextIndex-1, 1))
+				time.Sleep(10 * time.Millisecond)
+			}else{
+			// rf.logger.Infof("replication thread for leader %v replicated %v logs to server %v", rf.me, len(args.Entries), r.serverId)
+			// update leader commit index
+			r.commitment.updateCommitIndex(r.serverId, lastLogIndex)
+			// update next index 
+			r.setNextIndex(lastLogIndex + 1)
+			break
+			}
 		}
 	}
 }
