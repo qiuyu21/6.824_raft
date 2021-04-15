@@ -31,21 +31,24 @@ func newInmemLogStore() *InmemLogStore {
 	}
 }
 
+// *WARNING*: don't hold the s.mu lock, calling function should have hold the lock
 func (s *InmemLogStore) FirstIndex() uint64 {
 	s.RLock()
 	defer s.RUnlock()
 	return s.lowIndex
 }
 
+// *WARNING*: don't hold the s.mu lock, calling function should have hold the lock
 func (s *InmemLogStore) LastIndex() uint64 {
 	s.RLock()
 	defer s.RUnlock()
 	return s.highIndex
 }
 
+// *WARNING*: don't hold the s.mu lock, calling function should have hold the lock
 func (s *InmemLogStore) GetLog(index uint64, log *Log) error {
-	s.RLock()
-	defer s.RUnlock()
+	// s.RLock()
+	// defer s.RUnlock()
 	l, ok := s.logs[index];
 	if ok == false {
 		return ErrLogNotFound
@@ -54,13 +57,15 @@ func (s *InmemLogStore) GetLog(index uint64, log *Log) error {
 	return nil
 }
 
+// *WARNING*: don't hold the s.mu lock, calling function should have hold the lock
 func (s *InmemLogStore) StoreLog(log *Log) error {
 	return s.StoreLogs([]*Log{log})
 }
 
+// *WARNING*: don't hold the s.mu lock, calling function should have hold the lock
 func (s *InmemLogStore) StoreLogs(logs []*Log) error {
-	s.Lock()
-	defer s.Unlock()
+	// s.Lock()
+	// defer s.Unlock()
 	for _, l := range logs {
 		s.logs[l.Index] = l 
 		if s.lowIndex == 0 {
@@ -73,9 +78,10 @@ func (s *InmemLogStore) StoreLogs(logs []*Log) error {
 	return nil
 }
 
+// *WARNING*: don't hold the s.mu lock, calling function should have hold the lock
 func (s *InmemLogStore) DeleteRange(min, max uint64) error {
-	s.Lock()
-	defer s.Unlock()
+	// s.Lock()
+	// defer s.Unlock()
 	for i := min; i <= max; i++ {
 		delete(s.logs, i)
 	}

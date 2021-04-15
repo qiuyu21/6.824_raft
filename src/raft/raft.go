@@ -19,15 +19,20 @@ package raft
 
 import (
 	//	"bytes"
+
+	"bytes"
 	"errors"
 	"fmt"
 	"math/rand"
+	"reflect"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.824/labgob"
+
+	"6.824/labgob"
 	"6.824/labrpc"
 	"github.com/sirupsen/logrus"
 )
@@ -92,29 +97,36 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	appliedIndex 	uint64
-	commitIndex 	uint64
-	currentTerm		uint64
-	leader			int
-	logger 			*logrus.Logger
-	logs 			LogStore
-	lastContact 	time.Time
-	lastVotedTerm 	uint64 
-	lastVotedFor 	int
-	lastLogIndex	uint64
-	lastLogTerm 	uint64
-	state 			uint8
-	notifyCh 		chan struct{} 	// notify main loop commit index has been updated
-	leaderState
+	appliedIndex 	uint64					// (not used yet) highest index of log entry applied to the state machine
+	commitIndex 	uint64					// (volatile) highest index of log entry replicated
+	currentTerm		uint64					// (persistent) current term
+	leader			int						// (volatile) leader id
+	logger 			*logrus.Logger			// (don't care) logger instance
+	logs 			*InmemLogStore			// (volatile) logs in memory
+	lastContact 	time.Time				// (volatile) last contact by leader's heartbeat
+	lastVotedTerm 	uint64 					// (persistent) last voted term
+	lastVotedFor 	int						// (persistent) last voted candidate
+	lastLogIndex	uint64					// cache of index of the last log
+	lastLogTerm 	uint64					// cache of term of the last log
+	state 			uint8					// (volatile) follower ? leader ? candidate ?
+	notifyCh 		chan struct{} 			// notify main loop commit index has been updated
+	leaderState							    // (volatile) states used by leader
 }
 
 type leaderState struct {
-	// only leader's main thread access this struct, no lock needed
 	// mu 				sync.Mutex
+	// inflight 		[]*pending
 	replState		map[int]*replicationState
-	inflight 		[]*pending
-	commitment 		*commitment
+	commitment 		*commitment			
 	commitCh 		chan struct{}
+}
+
+// persistState defines all fields that need to be persistent
+type PersistState struct {
+	CurrentTerm		uint64
+	LastVotedTerm 	uint64
+	LastVotedFor 	int
+	Logs			map[uint64]*Log
 }
 
 type commitment struct {
@@ -134,10 +146,10 @@ type replicationState struct {
 	notifyCh 		chan struct{}
 }
 
-type pending struct {
-	log 			*Log
-	responseCh		chan error
-	responded 		bool
+type PersistLogStore struct{
+	logs		map[uint64]*Log
+	highIndex	uint64
+	lowIndex 	uint64
 }
 
 type voteResult struct {
@@ -182,26 +194,12 @@ func (s matchIndexSlice) Len() int           { return len(s) }
 func (s matchIndexSlice) Less(i, j int) bool { return s[i] < s[j] }
 func (s matchIndexSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
-func (p *pending) respond(err error){
-	if p.responseCh == nil {
-		return
-	}
-	if p.responded {
-		return
-	}
-	p.responseCh <- err
-	close(p.responseCh)
-	p.responded = true
-}
-
-
 func (rf *Raft) getState() (s uint8){
 	rf.mu.Lock()
 	s = rf.state
 	rf.mu.Unlock()
 	return
 }
-
 
 func (rf *Raft) getLastEntry() (index uint64, term uint64){
 	rf.mu.Lock()
@@ -237,8 +235,7 @@ func (rf *Raft) sendApplyMsg() {
 	rf.mu.Unlock()
 	for i := uint64(1); i<=commitIndex; i++ {
 		var l Log
-		if err := rf.logs.GetLog(i, &l); err != nil {
-			fmt.Println("=====error sendApplyMsg=====")
+		if err := rf.readLog(i, &l); err != nil {
 			return
 		}
 		rf.applyCh <- ApplyMsg{
@@ -250,28 +247,16 @@ func (rf *Raft) sendApplyMsg() {
 }
 
 //
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-//
-func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
-}
-
-
-//
 // restore previously persisted state.
 //
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(s *PersistState) error { 
+	data := rf.persister.ReadRaftState()
 	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
+		s.CurrentTerm = 0
+		s.LastVotedFor = 0
+		s.LastVotedTerm = 0
+		s.Logs = make(map[uint64]*Log)
+		return nil
 	}
 	// Your code here (2C).
 	// Example:
@@ -286,8 +271,117 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if err := d.Decode(s); err != nil {
+		return err
+	}
+	return nil
 }
 
+//
+// save Raft's persistent state to stable storage,
+// where it can later be retrieved after a crash and restart.
+// see paper's Figure 2 for a description of what should be persistent.
+// *WARNING*: don't hold the rf.mu lock, the calling chain should have a function tha has acquired the lock
+func (rf *Raft) persist(state *PersistState) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(state)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+	
+}
+
+// *WARNING*: don't hold the rf.mu lock, calling function should have hold the lock
+func (rf *Raft) persistCurrentTerm(t uint64) {
+	rf.logs.Lock()
+	defer rf.logs.Unlock()
+	var s PersistState
+	s.CurrentTerm = t
+	s.LastVotedFor = rf.lastVotedFor
+	s.LastVotedTerm = rf.lastVotedTerm
+	s.Logs = rf.logs.copyOfLogs()
+	rf.persist(&s)
+	rf.currentTerm = t
+}
+
+// *WARNING*: don't hold the rf.mu lock, calling function should have hold the lock
+func (rf *Raft) persistVote(term uint64, candidateId int){
+	rf.logs.Lock()
+	defer rf.logs.Unlock()
+	var s PersistState
+	s.CurrentTerm = rf.currentTerm
+	s.LastVotedFor = candidateId
+	s.LastVotedTerm = term
+	s.Logs = rf.logs.copyOfLogs()
+	rf.persist(&s)
+	rf.lastVotedTerm = term
+	rf.lastVotedFor = candidateId
+}
+
+// *WARNING*: don't hold the rf.mu lock, calling function should have hold the lock
+// writeLogs writes the logs to disk and memory
+func (rf *Raft) writeLogs(newlogs []*Log) error{
+	rf.logs.Lock()
+	defer rf.logs.Unlock()
+	var s PersistState
+	s.CurrentTerm = rf.currentTerm
+	s.LastVotedFor = rf.lastVotedFor
+	s.LastVotedTerm = rf.lastVotedTerm
+	s.Logs = rf.logs.copyOfLogs()
+	for _, log := range newlogs {
+		s.Logs[log.Index] = log
+	}
+	rf.persist(&s)
+	rf.logs.StoreLogs(newlogs)
+	return nil
+}
+
+// *WARNING*: don't hold the rf.mu lock, calling function should have hold the lock
+// readLog reads log from memory
+func (rf *Raft) readLog(index uint64, l *Log) error{
+	rf.logs.Lock()
+	defer rf.logs.Unlock()
+	err := rf.logs.GetLog(index, l)
+	return err
+}
+
+// *WARNING*: don't hold the rf.mu lock, calling function should have hold the lock
+// deleteLogs deletes logs from memory and disk
+func (rf *Raft) deleteLogs(start, end uint64) error {
+	rf.logs.Lock()
+	defer rf.logs.Unlock()
+	var s PersistState
+	s.CurrentTerm = rf.currentTerm
+	s.LastVotedFor = rf.lastVotedFor
+	s.LastVotedTerm = rf.lastVotedTerm
+	s.Logs = rf.logs.copyOfLogs()
+	for i := start; i<=end; i++ {
+		delete(s.Logs, i)
+	}
+	rf.persist(&s)
+	rf.logs.DeleteRange(start, end)
+	return nil
+}
+
+// copyLogs returns a new copy of the in memory logs
+func (i *InmemLogStore) copyOfLogs() map[uint64]*Log {
+	logcopy := make(map[uint64]*Log)
+	for _, log := range i.logs {
+		l := new(Log)
+		*l = *log
+		l.Data = copyValue(l)
+		logcopy[l.Index] = l
+	}
+	return logcopy
+}
+
+// copyValue make a copy of interface type
+func copyValue(l *Log) interface{} {
+	return reflect.ValueOf(l.Data).Interface()
+}
 
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -334,7 +428,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if args.Term > reply.Term {
-		rf.currentTerm = args.Term 
+		//Persisit the term
+		rf.persistCurrentTerm(args.Term)
 		reply.Term = args.Term
 	}
 
@@ -353,8 +448,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.VoteGranted = true 
 
-	rf.lastVotedFor = args.CandidateId
-	rf.lastVotedTerm = reply.Term 
+	rf.persistVote(reply.Term, args.CandidateId)
 	return
 }
 
@@ -368,14 +462,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.LastIndex = rf.lastLogIndex
 	
 	if reply.Term > args.Term {
-		// fmt.Printf("(1) leader %v with term %v is sending %v logs to %v with term %v\n", args.LeaderId, args.Term, len(args.Entries), rf.me, rf.currentTerm)
-		// fmt.Printf("Replying: success: %v, term: %v\n", reply.Success, reply.Term)
 		return 
 	}
 
 	if args.Term > reply.Term || rf.state != Follower {
 		rf.state = Follower 
-		rf.currentTerm = args.Term
+		rf.persistCurrentTerm(args.Term)
 		reply.Term = args.Term
 	}
 
@@ -388,29 +480,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			term = rf.lastLogTerm
 		}else{
 			var l Log
-			if err := rf.logs.GetLog(args.PrevLogIndex, &l); err != nil{
+			if err := rf.readLog(args.PrevLogIndex, &l); err != nil{
 				rf.logger.Errorf("1:GetLog error: %v", err)
 				// return my last log index
 				return
 			}
 			term = l.Term
 		}
-		if term != args.PrevLogTerm {
-			// find the first index of the term
-			startIndex := rf.lastLogIndex - 1 
-			for startIndex > 0 {
-				var l Log 
-				if err := rf.logs.GetLog(startIndex, &l); err != nil {
-					rf.logger.Errorf("2:GetLog error: %v", err)
-					return
-				}
-				if l.Term != term {
-					break
-				}
-				startIndex--
-			}
-			reply.LastIndex = startIndex
-			// fmt.Printf("=========last index: %v\n", startIndex)
+		if term != args.PrevLogTerm { 
 			return
 		}
 	}
@@ -425,12 +502,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			// get the log
 			var l Log 
-			if err := rf.logs.GetLog(entry.Index, &l); err != nil {
+			if err := rf.readLog(entry.Index, &l); err != nil {
 				rf.logger.Errorf("3:GetLog error: %v", err)
 				return
 			}
 			if l.Term != entry.Term {
-				if err := rf.logs.DeleteRange(l.Index, rf.lastLogIndex); err != nil {
+				if err := rf.deleteLogs(l.Index, rf.lastLogIndex); err != nil {
 					rf.logger.Errorf("DeleteRange error: %v", err) 
 					return 
 				}
@@ -440,7 +517,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		if l := len(newlogs); l > 0 {
 			// store the logs
-			if err := rf.logs.StoreLogs(newlogs); err != nil {
+			if err := rf.writeLogs(newlogs); err != nil {
 				rf.logger.Errorf("StoreLogs error: %v", err)
 				return
 			}
@@ -529,22 +606,15 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	}
 	rf.lastLogIndex++
 	rf.lastLogTerm = rf.currentTerm
-	newLog := &pending{
-		log: &Log{
-			Data: command,
-			Index: rf.lastLogIndex,
-			Term: rf.currentTerm,
-		},
-		responseCh: make(chan error, 1),
-		responded: false,
+	log := &Log{
+		Data: command,
+		Index: rf.lastLogIndex,
+		Term: rf.currentTerm,
 	}
 	// persistently store the log 
-	rf.logs.StoreLog(newLog.log)
-	// append to inflight
-	// rf.inflight = append(rf.inflight, newLog)
-	// update leader match index
+	rf.writeLogs([]*Log{log})
 	rf.commitment.mu.Lock()
-	rf.commitment.matchIndexes[rf.me] = newLog.log.Index
+	rf.commitment.matchIndexes[rf.me] = log.Index
 	rf.commitment.mu.Unlock()
 	// notify replication threads
 	for _, peer := range rf.leaderState.replState {
@@ -555,8 +625,8 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 			}
 		}(peer)
 	}
-	index = int(newLog.log.Index)
-	term = int(newLog.log.Term)
+	index = int(log.Index)
+	term = int(log.Term)
 	return
 }
 
@@ -624,7 +694,7 @@ func (rf *Raft) runCandidate() {
 	rf.logger.Infof("server %v entering Candidate state", rf.me)
 
 	rf.mu.Lock()
-	rf.currentTerm++
+	rf.persistCurrentTerm(rf.currentTerm+1)
 	newTerm := rf.currentTerm
 	votesCh := rf.electSelf()
 	rf.mu.Unlock()
@@ -647,7 +717,7 @@ func (rf *Raft) runCandidate() {
 				rf.logger.Infof("candidate %v receives newer term from %v", rf.me, vote.server)
 			
 				rf.mu.Lock()
-				rf.currentTerm = vote.reply.Term
+				rf.persistCurrentTerm(vote.reply.Term)
 				rf.state = Follower
 				rf.mu.Unlock()
 			
@@ -695,8 +765,9 @@ func (rf *Raft) electSelf() <-chan *voteResult{
 		}
 	}
 
-	rf.lastVotedFor = rf.me
-	rf.lastVotedTerm = rf.currentTerm
+	// rf.lastVotedFor = rf.me
+	// rf.lastVotedTerm = rf.currentTerm
+	rf.persistVote(rf.currentTerm, rf.me)
 	votesCh <- &voteResult{
 		server: rf.me,
 		ok: true,
@@ -758,7 +829,6 @@ func (rf *Raft) runLeader() {
 
 func (rf *Raft) cleanupLeaderState() {
 	rf.leaderState.replState = nil
-	rf.inflight = nil
 	rf.commitment = nil
 	rf.commitCh = nil
 }
@@ -766,7 +836,6 @@ func (rf *Raft) cleanupLeaderState() {
 // lock is held in leader main thread
 func (rf *Raft) initializeLeaderState() {
 	rf.leaderState.replState = make(map[int]*replicationState, len(rf.peers)-1)
-	// rf.leaderState.inflight = make([]*pending, 0, 256)
 	rf.leaderState.commitCh = make(chan struct{}, 128)
 	rf.leaderState.commitment = &commitment{
 		matchIndexes: make(map[int]uint64, len(rf.peers)),
@@ -829,14 +898,14 @@ func (rf *Raft) replicate(r *replicationState){
 					// found newer term, step down
 					// rf.logger.Infof("replciation thead for leader %v has found newer term %v from server %v, stepping down", rf.me, reply.Term, r.serverId)
 					rf.mu.Lock()
-					rf.currentTerm = reply.Term 
+					rf.persistCurrentTerm(reply.Term)
 					rf.leader = -1
 					rf.state = Follower
 					rf.mu.Unlock()
 					return
 				}
 				// incorrect prevLogIndex || prevLogTerm
-				r.setNextIndex(max(r.nextIndex-1, 1))
+				r.setNextIndex(1)
 				time.Sleep(10 * time.Millisecond)
 			}else{
 			// rf.logger.Infof("replication thread for leader %v replicated %v logs to server %v", rf.me, len(args.Entries), r.serverId)
@@ -886,8 +955,6 @@ func (rf *Raft) makeAppendEntriesRequest(r *replicationState, args *AppendEntrie
 	if err = rf.makeLogs(args, nextIndex, lastLogIndex); err != nil{
 		return err
 	}
-	// fmt.Printf("leader %v sending %v logs to server %v, from index %v to index %v\n", 
-	// 			rf.me, lastLogIndex-nextIndex+1, r.serverId, nextIndex, lastLogIndex)
 	return
 }
 
@@ -898,7 +965,8 @@ func (rf *Raft) makePrev(args *AppendEntriesArgs, nextIndex uint64) error{
 		args.PrevLogTerm = 0
 	}else{
 		var l Log 
-		if err := rf.logs.GetLog(nextIndex-1, &l); err != nil {
+		if err := rf.readLog(nextIndex-1, &l); err != nil {
+			rf.logger.Errorf("2:GetLog error: %v", err)
 			return err
 		}
 		args.PrevLogIndex = l.Index
@@ -907,12 +975,12 @@ func (rf *Raft) makePrev(args *AppendEntriesArgs, nextIndex uint64) error{
 	return nil
 }
 
-// makeLogs is called by makeAppendEntriesRequest to continue setting up AppendEntriesArgs
+// makeLogs is called by makeAppendEntriesRequest to set up AppendEntriesArgs
 func (rf *Raft) makeLogs(args *AppendEntriesArgs, nextIndex, endIndex uint64) error {
 	logs := make([]*Log, 0, 128)
 	for i := nextIndex; i<=endIndex; i++ {
 		l := new(Log)
-		if err := rf.logs.GetLog(i, l); err != nil{
+		if err := rf.readLog(i, l); err != nil{
 			return err
 		}
 		logs = append(logs, l)
@@ -956,7 +1024,7 @@ func (rf *Raft) heartbeat(serverId int, term uint64) {
 		if reply.Success == false {
 			rf.logger.Infof("leader %v's heartbeat was rejected by %v", rf.me, serverId)
 			rf.mu.Lock()
-			rf.currentTerm = reply.Term
+			rf.persistCurrentTerm(reply.Term)
 			rf.leader = -1
 			rf.state = Follower
 			rf.mu.Unlock()
@@ -1013,10 +1081,29 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// rf.newLogCh = make(chan *pending, MaxAppend)
 	rf.logs = newInmemLogStore()
 
-	// rf.logger.SetLevel(logrus.ErrorLevel)
-
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	var s PersistState
+	if err := rf.readPersist(&s); err != nil {
+		fmt.Printf("read persist error: %v\n", err)
+	}	
+	rf.currentTerm = s.CurrentTerm
+	rf.lastVotedTerm = s.LastVotedTerm
+	rf.lastVotedFor = s.LastVotedFor
+	rf.logs.logs = s.Logs
+
+	// update last log index & term
+	var lastIndex uint64 = 0
+	for _, log := range rf.logs.logs {
+		if log.Index > lastIndex {
+			lastIndex = log.Index
+		}
+	}
+	rf.lastLogIndex = lastIndex
+	if lastIndex == 0 {
+		rf.lastLogTerm = 0
+	}else {
+		rf.lastLogTerm = rf.logs.logs[lastIndex].Term
+	}
 
 	// start ticker goroutine to start elections
 	// go rf.ticker()
