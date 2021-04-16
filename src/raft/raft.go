@@ -45,8 +45,8 @@ const (
 
 const (
 	ElectionTimeout time.Duration = 1500 * time.Millisecond
-	HeartbeatTimeout time.Duration = 100 * time.Millisecond
-	ReplicationTimeout time.Duration = 500 * time.Millisecond
+	HeartbeatTimeout time.Duration = 200 * time.Millisecond
+	ReplicationTimeout time.Duration = 200 * time.Millisecond
 	FailWait time.Duration = 10 * time.Millisecond
 )
 
@@ -188,6 +188,32 @@ type AppendEntriesReply struct {
 	Success 		bool
 	LastIndex		uint64
 }
+
+type InstallSnapshotArgs struct {
+
+}
+
+type InstallSnapshotReply struct {
+	
+}
+
+//
+// A service wants to switch to snapshot.  Only do so if Raft hasn't
+// have more recent info since it communicate the snapshot on applyCh.
+//
+func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
+	// Your code here (2D).
+	return true
+}
+
+// the service says it has created a snapshot that has
+// all info up to and including index. this means the
+// service no longer needs the log through (and including)
+// that index. Raft should now trim its log as much as possible.
+func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	// Your code here (2D).
+}
+
 
 type matchIndexSlice []uint64
 func (s matchIndexSlice) Len() int           { return len(s) }
@@ -384,23 +410,6 @@ func copyValue(l *Log) interface{} {
 }
 
 //
-// A service wants to switch to snapshot.  Only do so if Raft hasn't
-// have more recent info since it communicate the snapshot on applyCh.
-//
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-	// Your code here (2D).
-	return true
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
-}
-
-//
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -578,6 +587,12 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
+
+func (rf *Raft) sendSnapshot() bool {
+	return false
+}
+
+
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -1004,18 +1019,12 @@ func (r *replicationState) setNextIndex(index uint64) {
 }
 
 func (rf *Raft) heartbeat(serverId int, term uint64) {
-
-	// don't immediately send heartbeat to avoid multiple leaders
-	// time.Sleep(10 * time.Millisecond)
-
 	for {
 		var args AppendEntriesArgs
 		var reply AppendEntriesReply
 		args.Term = term
 		args.LeaderId = rf.me
-
 		time.Sleep(HeartbeatTimeout)
-
 		if err:= rf.sendAppendEntries(serverId, &args, &reply); err == false {
 			// rf.logger.Infof("leader %v has lost connection to %v", rf.me, serverId)
 			time.Sleep(FailWait)
