@@ -33,15 +33,15 @@ func newInmemLogStore() *InmemLogStore {
 
 // *WARNING*: don't hold the s.mu lock, calling function should have hold the lock
 func (s *InmemLogStore) FirstIndex() uint64 {
-	s.RLock()
-	defer s.RUnlock()
+	// s.RLock()
+	// defer s.RUnlock()
 	return s.lowIndex
 }
 
 // *WARNING*: don't hold the s.mu lock, calling function should have hold the lock
 func (s *InmemLogStore) LastIndex() uint64 {
-	s.RLock()
-	defer s.RUnlock()
+	// s.RLock()
+	// defer s.RUnlock()
 	return s.highIndex
 }
 

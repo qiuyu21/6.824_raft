@@ -229,7 +229,6 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 			// depending on the Raft implementation, but
 			// just in case.
 			// DPrintf("Ignore: Index %v lastApplied %v\n", m.CommandIndex, lastApplied)
-
 		}
 	}
 }
