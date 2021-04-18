@@ -44,8 +44,8 @@ const (
 
 const (
 	ElectionTimeout time.Duration = 1500 * time.Millisecond
-	HeartbeatTimeout time.Duration = 200 * time.Millisecond
-	ReplicationTimeout time.Duration = 200 * time.Millisecond
+	HeartbeatTimeout time.Duration = 100 * time.Millisecond
+	ReplicationTimeout time.Duration = 300 * time.Millisecond
 	FailWait time.Duration = 10 * time.Millisecond
 )
 
@@ -250,6 +250,7 @@ func (rf *Raft) sendApplyMsg() {
 	for i := uint64(1); i<=commitIndex; i++ {
 		var l Log
 		if err := rf.readLog(i, &l); err != nil {
+			rf.logger.Errorf("6:GetLog error: %v", err)
 			return
 		}
 		rf.applyCh <- ApplyMsg{
@@ -335,6 +336,7 @@ func (rf *Raft) readSnapshot(s *PersistSnapshop) error {
 		s.Snapshot = nil
 		s.SnapshotLastIndex = 0
 		s.SnapshotLastTerm = 0
+		return nil
 	}
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
@@ -399,7 +401,7 @@ func (rf *Raft) persistCurrentTerm(t uint64) {
 	p.Logs = rf.logs.copyOfLogs()
 	s.Snapshot = rf.snapshot
 	s.SnapshotLastIndex = rf.snapshotLastIndex
-	s.SnapshotLastTerm = p.Logs[rf.snapshotLastIndex].Term
+	s.SnapshotLastTerm = rf.snapshotLastTerm
 	rf.persist(&p, &s)
 	// update in memory fields
 	rf.currentTerm = t
@@ -417,9 +419,9 @@ func (rf *Raft) persistVote(term uint64, candidateId int){
 	p.Logs = rf.logs.copyOfLogs()
 	s.Snapshot = rf.snapshot
 	s.SnapshotLastIndex = rf.snapshotLastIndex
-	s.SnapshotLastTerm = p.Logs[rf.snapshotLastIndex].Term
+	s.SnapshotLastTerm = rf.snapshotLastTerm
 	rf.persist(&p, &s)
-	// update in memory fields
+	// update memory fields
 	rf.lastVotedTerm = term
 	rf.lastVotedFor = candidateId
 }
@@ -440,7 +442,7 @@ func (rf *Raft) writeLogs(newlogs []*Log) error{
 	}
 	s.Snapshot = rf.snapshot
 	s.SnapshotLastIndex = rf.snapshotLastIndex
-	s.SnapshotLastTerm = p.Logs[rf.snapshotLastIndex].Term
+	s.SnapshotLastTerm = rf.snapshotLastTerm
 	rf.persist(&p, &s)
 	rf.logs.StoreLogs(newlogs)
 	return nil
@@ -471,7 +473,7 @@ func (rf *Raft) deleteLogs(start, end uint64) error {
 	}
 	s.Snapshot = rf.snapshot
 	s.SnapshotLastIndex = rf.snapshotLastIndex
-	s.SnapshotLastTerm = p.Logs[rf.snapshotLastIndex].Term
+	s.SnapshotLastTerm = rf.snapshotLastIndex
 	rf.persist(&p, &s)
 	rf.logs.DeleteRange(start, end)
 	return nil
@@ -583,7 +585,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			var l Log
 			for i := args.PrevLogIndex; i > rf.snapshotLastIndex; i-- {
 				if err := rf.readLog(i, &l); err != nil {
-					rf.logger.Errorf("4:GetLog error: %v", err)
+					rf.logger.Errorf("2:GetLog error: %v", err)
 				}
 				if l.Term != term {
 					break
@@ -848,8 +850,6 @@ func (rf *Raft) runCandidate() {
 			
 				return
 			}
-		// case r := <-rf.newLogCh:
-		// 	r.respond(ErrNotLeader)
 		}
 	}
 }
@@ -1004,30 +1004,30 @@ func (rf *Raft) replicate(r *replicationState){
 				// inconsistent log
 				r.setNextIndex(reply.LastIndex)
 				// send snapshot if log at next index is snapshotted
-				rf.mu.Lock()
-				snapshotLastIndex := rf.snapshotLastIndex
-				rf.mu.Unlock()
-				if r.nextIndex < snapshotLastIndex {
-					// send snapshot
-					var args1 InstallSnapshotArgs
-					var reply1 InstallSnapshotReply
-					rf.makeInstallSnapshotArgs(&args1)
-					if ok := rf.sendSnapshot(r.serverId, &args1, &reply1); ok == false {
-						time.Sleep(FailWait)
-						continue
-					}
-					if reply1.Term > args1.Term {
-						// found newer term, step down
-						rf.mu.Lock()
-						rf.persistCurrentTerm(reply.Term)
-						rf.leader = -1
-						rf.state = Follower
-						rf.mu.Unlock()
-						return
-					}
-					// update next index
-					r.setNextIndex(args1.LastIncludedIndex + 1)
-				}
+				// rf.mu.Lock()
+				// snapshotLastIndex := rf.snapshotLastIndex
+				// rf.mu.Unlock()
+				// if r.nextIndex < snapshotLastIndex {
+				// 	// send snapshot
+				// 	var args1 InstallSnapshotArgs
+				// 	var reply1 InstallSnapshotReply
+				// 	rf.makeInstallSnapshotArgs(&args1)
+				// 	if ok := rf.sendSnapshot(r.serverId, &args1, &reply1); ok == false {
+				// 		time.Sleep(FailWait)
+				// 		continue
+				// 	}
+				// 	if reply1.Term > args1.Term {
+				// 		// found newer term, step down
+				// 		rf.mu.Lock()
+				// 		rf.persistCurrentTerm(reply.Term)
+				// 		rf.leader = -1
+				// 		rf.state = Follower
+				// 		rf.mu.Unlock()
+				// 		return
+				// 	}
+				// 	// update next index
+				// 	r.setNextIndex(args1.LastIncludedIndex + 1)
+				// }
 				// next index is not in the snapshot
 				time.Sleep(FailWait)
 			}else{
@@ -1051,7 +1051,6 @@ func (rf *Raft) makeInstallSnapshotArgs(args *InstallSnapshotArgs) {
 	args.LastIncludedIndex = rf.snapshotLastIndex
 	args.Data = rf.snapshot
 }
-
 
 func (c *commitment) updateCommitIndex(serverId int, matchIndex uint64) {
 	c.mu.Lock()
@@ -1101,7 +1100,7 @@ func (rf *Raft) makePrev(args *AppendEntriesArgs, nextIndex uint64) error{
 	}else{
 		var l Log 
 		if err := rf.readLog(nextIndex-1, &l); err != nil {
-			rf.logger.Errorf("2:GetLog error: %v", err)
+			rf.logger.Errorf("4:GetLog error: %v", err)
 			return err
 		}
 		args.PrevLogIndex = l.Index
@@ -1116,6 +1115,7 @@ func (rf *Raft) makeLogs(args *AppendEntriesArgs, nextIndex, endIndex uint64) er
 	for i := nextIndex; i<=endIndex; i++ {
 		l := new(Log)
 		if err := rf.readLog(i, l); err != nil{
+			rf.logger.Errorf("5:GetLog error: %v", err)
 			return err
 		}
 		logs = append(logs, l)
