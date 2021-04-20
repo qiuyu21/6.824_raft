@@ -10,13 +10,27 @@ type PersistState struct {
 	CurrentTerm 	uint64
 	LastVotedTerm	uint64
 	LastVotedFor	int
-	LogStore 		*InmemLogStore
+	LogStore 		*PersistLog
 }
 
 type PersistSnapshot struct {
 	Snapshot 			[]byte
 	SnapshotLastIndex 	uint64
 	SnapshotLastTerm 	uint64
+}
+
+type PersistLog struct {
+	Logs 		map[uint64]*Log		
+	LowIndex 	uint64				
+	HighIndex 	uint64 	
+}
+
+func NewPersistLog() *PersistLog {
+	i := new(PersistLog)
+	i.Logs = make(map[uint64]*Log)
+	i.LowIndex = 0
+	i.HighIndex = 0
+	return i
 }
 
 // save Raft's persistent state to stable storage,
@@ -45,7 +59,7 @@ func (rf *Raft) readState(pState *PersistState)  error {
 		pState.CurrentTerm = 0
 		pState.LastVotedFor = -1
 		pState.LastVotedTerm = 0
-		pState.LogStore = NewInmemLogStore()
+		pState.LogStore = nil
 		return nil
 	}
 	r := bytes.NewBuffer(data)
@@ -80,7 +94,7 @@ func (rf *Raft) makePersistStateArgs() (pState *PersistState, pSnapshot *Persist
 	pState.CurrentTerm = rf.currentTerm
 	pState.LastVotedTerm = rf.lastVotedTerm
 	pState.LastVotedFor = rf.lastVotedFor
-	pState.LogStore = rf.logStore.copyOfStore()
+	pState.LogStore = NewPersistLog()
 	pSnapshot.Snapshot = rf.snapshot.snapshot
 	pSnapshot.SnapshotLastIndex = rf.snapshotLastIndex
 	pSnapshot.SnapshotLastTerm = rf.snapshotLastTerm
@@ -105,7 +119,13 @@ func (rf *Raft) persistVote(term uint64, candidateId int){
 
 func (rf *Raft) persistWriteLogs(newlogs []*Log) error {
 	pState, pSnap :=  rf.makePersistStateArgs()
-	pState.LogStore.StoreLogs(newlogs)
+	//
+	logCopy := rf.logStore.copyOfStore()
+	logCopy.StoreLogs(newlogs)
+	pState.LogStore.LowIndex = logCopy.LowIndex
+	pState.LogStore.HighIndex = logCopy.HighIndex
+	pState.LogStore.Logs = logCopy.Logs
+	//
 	rf.persist(pState, pSnap)
 	rf.logStore.StoreLogs(newlogs)
 	return nil
@@ -113,7 +133,13 @@ func (rf *Raft) persistWriteLogs(newlogs []*Log) error {
 
 func (rf *Raft) persistDeleteLogs(start, end uint64) error {
 	pState, pSnap :=  rf.makePersistStateArgs()
-	pState.LogStore.DeleteLogs(start, end)
+	//
+	logCopy := rf.logStore.copyOfStore()
+	logCopy.DeleteLogs(start,end)
+	pState.LogStore.LowIndex = logCopy.LowIndex
+	pState.LogStore.HighIndex = logCopy.HighIndex
+	pState.LogStore.Logs = logCopy.Logs
+	//
 	rf.persist(pState, pSnap)
 	rf.logStore.DeleteLogs(start, end)
 	return nil

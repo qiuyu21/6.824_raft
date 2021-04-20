@@ -28,3 +28,8 @@ func max(a, b uint64) uint64 {
 		return b
 	}
 }
+
+type matchIndexSlice []uint64
+func (s matchIndexSlice) Len() int           { return len(s) }
+func (s matchIndexSlice) Less(i, j int) bool { return s[i] < s[j] }
+func (s matchIndexSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }

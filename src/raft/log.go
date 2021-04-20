@@ -1,6 +1,9 @@
 package raft
 
-import "reflect"
+import (
+	"reflect"
+	"sync"
+)
 
 type Log struct {
 	Index	uint64
@@ -8,19 +11,22 @@ type Log struct {
 	Data 	interface{}
 }
 
-// ** InmemLogStore share the same lock as the Raft's mu lock
-// ** Calling functions should hold the lock before invoking any function here
 type InmemLogStore struct {
-	Logs 		map[uint64]*Log		// Persistent
-	LowIndex 	uint64				// Persistent
-	HighIndex 	uint64 				// Persistent
+	mu sync.RWMutex
+	Logs 		map[uint64]*Log		
+	LowIndex 	uint64				
+	HighIndex 	uint64 				
 }
 
 func (s *InmemLogStore) FirstIndex() uint64 {
-	return s.LowIndex	
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.LowIndex
 }
 
 func (s *InmemLogStore) LastIndex() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.HighIndex
 }
 
@@ -33,6 +39,8 @@ func NewInmemLogStore() *InmemLogStore {
 }
 
 func (s *InmemLogStore) GetLog(index uint64, log *Log) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	l, ok := s.Logs[index]
 	if ok == false {
 		return ErrLogNotFound
@@ -46,6 +54,8 @@ func (s *InmemLogStore) StoreLog(log *Log) error {
 }
 
 func (s *InmemLogStore) StoreLogs(logs []*Log) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, l := range logs {
 		s.Logs[l.Index] = l 
 		if s.LowIndex == 0 {
@@ -59,6 +69,8 @@ func (s *InmemLogStore) StoreLogs(logs []*Log) error {
 }
 
 func (s *InmemLogStore) DeleteLogs(min, max uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for i := min; i <= max; i++ {
 		delete(s.Logs, i)
 	}
@@ -81,6 +93,8 @@ func copyValue(l *Log) interface{} {
 
 // copyOfStore makes a deep copy of InmemLogstore
 func (i *InmemLogStore) copyOfStore() *InmemLogStore {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
 	storeCopy := new(InmemLogStore)
 	logcopy := make(map[uint64]*Log)
 	for _, log := range i.Logs {
