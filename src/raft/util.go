@@ -1,9 +1,6 @@
 package raft
 
-import (
-	"log"
-	"time"
-)
+import "log"
 
 // Debugging
 const Debug = false
@@ -30,14 +27,4 @@ func max(a, b uint64) uint64 {
 	}else{
 		return b
 	}
-}
-
-
-func backoff(base time.Duration, round, limit uint64) time.Duration {
-	power := min(round, limit)
-	for power > 2 {
-		base *= 2
-		power-- 
-	}
-	return base
 }

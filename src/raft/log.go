@@ -1,55 +1,39 @@
 package raft
 
-import "sync"
-
-type LogStore interface {
-	FirstIndex() uint64
-	LastIndex() uint64
-	GetLog(index uint64, log *Log) error
-	StoreLog(log *Log) error
-	StoreLogs(logs []*Log) error
-	DeleteRange(min, max uint64) error
-}
+import "reflect"
 
 type Log struct {
-	Index 	uint64
-	Term 	uint64
+	Index	uint64
+	Term	uint64
 	Data 	interface{}
 }
 
-// InmemLogStore implements LogStore interface, and is intended for testing
+// ** InmemLogStore share the same lock as the Raft's mu lock
+// ** Calling functions should hold the lock before invoking any function here
 type InmemLogStore struct {
-	sync.RWMutex
-	logs		map[uint64]*Log
-	highIndex 	uint64 
-	lowIndex 	uint64
+	Logs 		map[uint64]*Log		// Persistent
+	LowIndex 	uint64				// Persistent
+	HighIndex 	uint64 				// Persistent
 }
 
-func newInmemLogStore() *InmemLogStore {
-	return &InmemLogStore{
-		logs: make(map[uint64]*Log),
-	}
-}
-
-// *WARNING*: don't hold the s.mu lock, calling function should have hold the lock
 func (s *InmemLogStore) FirstIndex() uint64 {
-	// s.RLock()
-	// defer s.RUnlock()
-	return s.lowIndex
+	return s.LowIndex	
 }
 
-// *WARNING*: don't hold the s.mu lock, calling function should have hold the lock
 func (s *InmemLogStore) LastIndex() uint64 {
-	// s.RLock()
-	// defer s.RUnlock()
-	return s.highIndex
+	return s.HighIndex
 }
 
-// *WARNING*: don't hold the s.mu lock, calling function should have hold the lock
+func NewInmemLogStore() *InmemLogStore {
+	i := new(InmemLogStore)
+	i.Logs = make(map[uint64]*Log)
+	i.LowIndex = 0
+	i.HighIndex = 0
+	return i
+}
+
 func (s *InmemLogStore) GetLog(index uint64, log *Log) error {
-	// s.RLock()
-	// defer s.RUnlock()
-	l, ok := s.logs[index];
+	l, ok := s.Logs[index]
 	if ok == false {
 		return ErrLogNotFound
 	}
@@ -57,43 +41,56 @@ func (s *InmemLogStore) GetLog(index uint64, log *Log) error {
 	return nil
 }
 
-// *WARNING*: don't hold the s.mu lock, calling function should have hold the lock
 func (s *InmemLogStore) StoreLog(log *Log) error {
 	return s.StoreLogs([]*Log{log})
 }
 
-// *WARNING*: don't hold the s.mu lock, calling function should have hold the lock
 func (s *InmemLogStore) StoreLogs(logs []*Log) error {
-	// s.Lock()
-	// defer s.Unlock()
 	for _, l := range logs {
-		s.logs[l.Index] = l 
-		if s.lowIndex == 0 {
-			s.lowIndex = l.Index
+		s.Logs[l.Index] = l 
+		if s.LowIndex == 0 {
+			s.LowIndex = l.Index
 		}
-		if s.highIndex < l.Index {
-			s.highIndex = l.Index
+		if s.HighIndex < l.Index {
+			s.HighIndex = l.Index
 		}
 	}
 	return nil
 }
 
-// *WARNING*: don't hold the s.mu lock, calling function should have hold the lock
-func (s *InmemLogStore) DeleteRange(min, max uint64) error {
-	// s.Lock()
-	// defer s.Unlock()
+func (s *InmemLogStore) DeleteLogs(min, max uint64) error {
 	for i := min; i <= max; i++ {
-		delete(s.logs, i)
+		delete(s.Logs, i)
 	}
-	if min <= s.lowIndex {
-		s.lowIndex = max + 1
+	if min <= s.LowIndex {
+		s.LowIndex = max + 1
 	}
-	if max >= s.highIndex {
-		s.lowIndex = min - 1
+	if max >= s.HighIndex {
+		s.LowIndex = min - 1
 	}
-	if s.lowIndex > s.highIndex {
-		s.lowIndex = 0
-		s.highIndex = 0
+	if s.LowIndex > s.HighIndex {
+		s.LowIndex = 0
+		s.HighIndex = 0
 	}
 	return nil
+}
+
+func copyValue(l *Log) interface{} {
+	return reflect.ValueOf(l.Data).Interface()
+}
+
+// copyOfStore makes a deep copy of InmemLogstore
+func (i *InmemLogStore) copyOfStore() *InmemLogStore {
+	storeCopy := new(InmemLogStore)
+	logcopy := make(map[uint64]*Log)
+	for _, log := range i.Logs {
+		l := new(Log)
+		*l = *log
+		l.Data = copyValue(l)
+		logcopy[l.Index] = l
+	}
+	storeCopy.Logs = logcopy
+	storeCopy.LowIndex = i.LowIndex
+	storeCopy.HighIndex = i.HighIndex
+	return storeCopy
 }

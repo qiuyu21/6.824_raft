@@ -8,23 +8,19 @@ package raft
 // test with the original before submitting.
 //
 
-import (
-	"bytes"
-	"log"
-	"math/rand"
-	"runtime"
-	"sync"
-	"testing"
-
-	"6.824/labgob"
-	"6.824/labrpc"
-
-	crand "crypto/rand"
-	"encoding/base64"
-	"fmt"
-	"math/big"
-	"time"
-)
+import "6.824/labgob"
+import "6.824/labrpc"
+import "bytes"
+import "log"
+import "sync"
+import "testing"
+import "runtime"
+import "math/rand"
+import crand "crypto/rand"
+import "math/big"
+import "encoding/base64"
+import "time"
+import "fmt"
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -141,7 +137,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 	err_msg := ""
 	v := m.Command
 	for j := 0; j < len(cfg.logs); j++ {
-		if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && (old != v) {
+		if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
 			log.Printf("%v: log %v; server %v\n", i, cfg.logs[i], cfg.logs[j])
 			// some server has already committed a different value for this entry!
 			err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
@@ -229,6 +225,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 			// depending on the Raft implementation, but
 			// just in case.
 			// DPrintf("Ignore: Index %v lastApplied %v\n", m.CommandIndex, lastApplied)
+
 		}
 	}
 }
@@ -522,6 +519,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				}
 			}
 		}
+
 		if index != -1 {
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
@@ -590,12 +588,4 @@ func (cfg *config) LogSize() int {
 		}
 	}
 	return logsize
-}
-
-func (cfg *config) showLogs() {
-	cfg.mu.Lock()
-	defer cfg.mu.Unlock()
-	for j := 0; j < len(cfg.logs); j++ {
-		log.Printf("%v: server %v\n\n\n", j, cfg.logs[j])
-	}
 }
