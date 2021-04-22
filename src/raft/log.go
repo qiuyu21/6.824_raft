@@ -78,7 +78,7 @@ func (s *InmemLogStore) DeleteLogs(min, max uint64) error {
 		s.LowIndex = max + 1
 	}
 	if max >= s.HighIndex {
-		s.LowIndex = min - 1
+		s.HighIndex = min - 1
 	}
 	if s.LowIndex > s.HighIndex {
 		s.LowIndex = 0

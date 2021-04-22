@@ -8,15 +8,15 @@ import (
 
 type PersistState struct {
 	CurrentTerm 	uint64
-	LastVotedTerm	uint64
-	LastVotedFor	int
+	LastVotedTerm 	uint64 
+	LastVotedFor 	int 
 	LogStore 		*PersistLog
 }
 
 type PersistSnapshot struct {
 	Snapshot 			[]byte
-	SnapshotLastIndex 	uint64
-	SnapshotLastTerm 	uint64
+	SnapshotLastIndex	uint64
+	SnapshotLastTerm	uint64
 }
 
 type PersistLog struct {
@@ -51,7 +51,6 @@ func (rf *Raft) persist(pState *PersistState, pSnapshot *PersistSnapshot) {
 	rf.persister.SaveStateAndSnapshot(state, snapshot)
 }
 
-
 // restore previously persisted state.
 func (rf *Raft) readState(pState *PersistState)  error {
 	data := rf.persister.ReadRaftState()
@@ -71,7 +70,7 @@ func (rf *Raft) readState(pState *PersistState)  error {
 }
 
 func (rf *Raft) readSnapshot(pSnapshot *PersistSnapshot) error {
-	data := rf.persister.ReadRaftState()
+	data := rf.persister.ReadSnapshot()
 	if data == nil || len(data) < 1 {
 		pSnapshot.Snapshot = nil
 		pSnapshot.SnapshotLastIndex = 0
@@ -86,8 +85,6 @@ func (rf *Raft) readSnapshot(pSnapshot *PersistSnapshot) error {
 	return nil
 }
 
-
-// *WARNING*: don't hold the rf.mu lock, calling function should have hold the lock
 func (rf *Raft) makePersistStateArgs() (pState *PersistState, pSnapshot *PersistSnapshot){
 	pState = new(PersistState)
 	pSnapshot = new(PersistSnapshot)

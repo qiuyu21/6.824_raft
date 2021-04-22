@@ -1,6 +1,10 @@
 package raft
 
-import "log"
+import (
+	"log"
+	"math/rand"
+	"time"
+)
 
 // Debugging
 const Debug = false
@@ -10,6 +14,12 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 		log.Printf(format, a...)
 	}
 	return
+}
+
+// return a random duration between base and 3 * base
+func randomTimeout(base time.Duration) time.Duration {
+	timeout := time.Duration(rand.Int63()) % (2*base)
+	return base + timeout
 }
 
 func min(a, b uint64) uint64 {
